@@ -1,0 +1,75 @@
+torch_home: ~/.cache/torch/
+seed: 2026
+use_amp: False
+num_workers: 8
+eval_only: True
+eval_ckpt: /home/xky/Desktop/OW-DFA/test/wandb/VAE-entropy/ckpts/best_P1_epoch=19_2026.ckpt
+enable_proto_pruning: False
+
+dataset:
+  data_root: /home/xky/Desktop/OW-DFA/OWDFA-CAL-main/data/OWDFA40-Benchmark/data
+  train_ratio_per_class: 0.8
+  prop_train_labels: 0.75
+  protocol: 1
+  mod: all
+  crop_face: True
+  predictor_path: /home/xky/Desktop/OW-DFA/OWDFA-CAL-main/data/OWDFA40-Benchmark/shape_predictor_68_face_landmarks.dat
+
+transform:
+  image_size: 256
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+    
+model:
+  name: DualLatentVAE
+  resume: 
+  params:
+    encoder: resnet50
+    num_classes: 41
+    pretrained: True
+
+method:
+  name: TestNet
+  params:
+    grl_alpha: 1.0  # 如果发现训练不稳定，可以调小这个值（如 0.1）
+
+optimizer:
+  name: Adam
+  params:
+    lr: 0.0002
+    weight_decay: 1.0e-3
+
+scheduler:
+  name: StepLR
+  params:
+    step_size: 10
+    gamma: 0.05
+
+loss:
+  recon_loss: 10.0
+  kl_loss: 0.005
+  adv_loss: 1.0
+  cls_loss: 1.0
+
+
+train:
+  epochs: 20
+  batch_size: 64
+  print_interval: 10
+  val_interval: 1 
+
+val:
+  batch_size: 128
+
+test:
+  batch_size: 128
+
+
+wandb:
+  entity: deepfake-attribution
+  project: OW-DFA
+  save_code: True
+  name: VAE_test
+  mode: "offline"
+  notes:
+  resume:
