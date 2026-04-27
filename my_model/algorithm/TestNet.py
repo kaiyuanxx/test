@@ -1,12 +1,11 @@
-import lightning.pytorch as pl
 import torch
+import torchvision
+import os
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import wandb
 
 from loguru import logger
-from my_model.algorithm import SLModel
+from .sl import SLModel
 from my_model.utils import AverageMeter, update_meter
 
 
@@ -25,7 +24,9 @@ def set_requires_grad(module, requires_grad):
 
 class TestNet(SLModel):
     def __init__(self, args):
-        super().__init__()
+        super().__init__(args)
+
+        self.num_known = len(args.known_classes)
     
         # 定义损失函数
         self.criterion_recon = nn.L1Loss()
@@ -36,9 +37,9 @@ class TestNet(SLModel):
         self.w_adv = args.loss.adv_loss
         self.w_cls = args.loss.cls_loss
         # 半监督一致性损失权重 & 伪标签阈值
-        self.w_consist_high = 1.0  
-        self.w_consist_low = 1.0   
-        self.pseudo_threshold = 0.95
+        self.w_consist_high = 0.5  
+        self.w_consist_low = 0.5   
+        self.pseudo_threshold = 0.80
     
 
     def get_loss_names(self):
@@ -100,6 +101,11 @@ class TestNet(SLModel):
         adv_loss = -entropy_loss(pred_sem)
         set_requires_grad(self.encoder.shared_classifier, True) # 恢复解冻
 
+        total_loss = self.w_recon * recon_loss + self.w_kl * kl_loss + self.w_adv * adv_loss
+        loss_map['recon_loss'] = recon_loss
+        loss_map['kl_loss'] = kl_loss
+        loss_map['adv_loss'] = adv_loss
+
 
         # =================================================================
         # 第二阶段：分离有标签数据 (全监督分类)
@@ -112,6 +118,9 @@ class TestNet(SLModel):
             # 正常交叉熵优化共享分类器
             pred_forg_l = self.encoder.shared_classifier(z_forg_l)
             cls_loss = self.criterion_ce(pred_forg_l, y_l)
+
+            total_loss += self.w_cls * cls_loss
+            loss_map['cls_loss'] = cls_loss
 
         # =================================================================
         # 第三阶段：分离无标签数据 (伪标签打靶 + 跨样本换脸一致性)
@@ -134,16 +143,21 @@ class TestNet(SLModel):
             low_conf_mask = max_probs < self.pseudo_threshold
 
             # (A) 高置信度样本：基于伪标签重新采样对齐分布
-            if high_conf_mask.sum() > 0:
+            if high_conf_mask.sum() > 1:
                 # 在高置信度样本的分布中*重新采样*一个潜变量
                 z_forg_u_high = self.encoder.reparameterize(
                     mu_forg_u[high_conf_mask], logvar_forg_u[high_conf_mask])
                 
                 pred_high = self.encoder.shared_classifier(z_forg_u_high)
-                loss_consist_high = self.criterion_ce(pred_high, pseudo_labels[high_conf_mask])
+                consist_high_loss = self.criterion_ce(pred_high, pseudo_labels[high_conf_mask])
+
+                total_loss += self.w_consist_high * consist_high_loss
+                loss_map['consist_high_loss'] = consist_high_loss
+            else:
+                loss_map['consist_high_loss'] = torch.tensor(0.0, device=images.device)
 
             # (B) 低置信度样本：基于语义扰动的伪造特征一致性
-            if low_conf_mask.sum() > 0:
+            if self.current_epoch >= 30 and low_conf_mask.sum() > 1:
                 # 1. 获取低置信样本自身的语义和伪造分布并重新采样
                 z_sem_self = self.encoder.reparameterize(mu_sem_u[low_conf_mask], logvar_sem_u[low_conf_mask])
                 z_forg_self = z_forg_u[low_conf_mask]  
@@ -167,31 +181,15 @@ class TestNet(SLModel):
                 pred_orig = self.encoder.shared_classifier(z_f_orig)
                 pred_swap = self.encoder.shared_classifier(z_f_swap)
                 
-                loss_consist_low = F.mse_loss(F.softmax(pred_orig, dim=1), F.softmax(pred_swap, dim=1))
+                consist_low_loss = F.mse_loss(F.softmax(pred_orig, dim=1), F.softmax(pred_swap, dim=1))
                 
-                total_loss = self.w_recon * recon_loss + self.w_kl * kl_loss + \
-                             self.w_adv * adv_loss + self.w_cls * cls_loss + \
-                             self.w_consist_high * loss_consist_high + self.w_consist_low * loss_consist_low
-                
-        loss_map['total_loss'] = total_loss
-        loss_map['recon_loss'] = recon_loss
-        loss_map['kl_loss'] = kl_loss
-        loss_map['adv_loss'] = adv_loss
-        loss_map['cls_loss'] = cls_loss
-        if unlabeled_mask.sum() > 0:
-            if high_conf_mask.sum() > 0:
-                loss_map['consist_high_loss'] = loss_consist_high
-            else:
-                loss_map['consist_high_loss'] = torch.tensor(0.0, device=images.device)
-            
-            if low_conf_mask.sum() > 0:
-                loss_map['consist_low_loss'] = loss_consist_low
+                total_loss += self.w_consist_low * consist_low_loss
+                loss_map['consist_low_loss'] = consist_low_loss
+
             else:
                 loss_map['consist_low_loss'] = torch.tensor(0.0, device=images.device)
-        else:
-            loss_map['consist_high_loss'] = torch.tensor(0.0, device=images.device)
-            loss_map['consist_low_loss'] = torch.tensor(0.0, device=images.device)
-
+            
+        loss_map['total_loss'] = total_loss
         
         for key, value in loss_map.items():
             update_meter(
@@ -204,5 +202,59 @@ class TestNet(SLModel):
     def on_train_epoch_end(self):
         """Log averaged training losses for the current epoch."""
         results = {key: meter.avg for key, meter in self.train_losses.items()}
-        logger.info(results, step=self.current_epoch)
+        logger.info(f"Epoch {self.current_epoch} results: {results}")
 
+    def test_step(self, batch, batch_idx):
+        if not hasattr(self, "val_step_outputs"):
+            self.val_step_outputs = {'preds': [], 'label': [], 'conf': []}
+
+        images= batch['image']
+        # --- 前向传播获取各种潜变量 ---
+        mu_sem, logvar_sem, mu_forg, logvar_forg = self.encoder.encode(images)
+        z_sem = self.encoder.reparameterize(mu_sem, logvar_sem)
+        z_forg = self.encoder.reparameterize(mu_forg, logvar_forg)
+
+        x_recon = self.encoder.decode(z_sem, z_forg)
+
+        if batch_idx < 5: 
+            self.save_reconstruction_results(images, x_recon, batch_idx)
+
+        return self.validation_step(batch, batch_idx)
+
+    def on_test_epoch_end(self):
+        if hasattr(self, "on_validation_epoch_end"):
+            return self.on_validation_epoch_end()
+        if hasattr(self, "validation_epoch_end"):
+            return self.validation_epoch_end([])
+        
+
+    def save_reconstruction_results(self, real_img, recon_img, batch_idx):
+        """
+        保存重构对比图：原图 | 重构图
+        """
+        save_dir = os.path.join(self.args.exam_dir, 'visualizations')
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+
+        # def denormalize(tensor):
+        #     return tensor.detach().cpu() * 0.5 + 0.5
+
+        # real_img = denormalize(real_img)
+        # recon_img = denormalize(recon_img)
+
+        # 3. 选取前 8 个样本进行展示
+        n_samples = min(real_img.size(0), 8)
+        
+        # 拼接图像：将三组图按行排列
+        # 每行显示：原图, 正常重构, 换脸重构
+        comparison_list = torch.cat([
+            real_img[:n_samples].cpu(), 
+            recon_img[:n_samples].cpu()
+        ])
+        
+        # 生成网格图 (每行 3 张图)
+        grid = torchvision.utils.make_grid(comparison_list, nrow=n_samples, normalize=True, padding=3, pad_value=1.0)
+        
+        # 4. 写入文件
+        save_path = os.path.join(save_dir, f'batch_{batch_idx}.png')
+        torchvision.utils.save_image(grid, save_path)
